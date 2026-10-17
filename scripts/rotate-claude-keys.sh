@@ -3,32 +3,42 @@
 #
 # Keys live inside the TEE from deploy time, so `gmcli set-api-keys` alone
 # changes nothing on a running worker: each CVM has to be torn down and
-# redeployed. This script does the whole rotation in the order that is safe:
+# redeployed.
+#
+# Default (rolling): offers stay up and the workers are replaced one at a
+# time, so at least one worker keeps serving — and keeps its sticky sessions —
+# the whole way through. Withdrawing every offer drops every session to other
+# miners, and winning them back takes many epochs.
 #
 #   1. check every new key against Anthropic (HTTP 200 + a 1-token request)
-#   2. snapshot the standing offers and write the re-declare commands to a file
-#   3. withdraw every offer (`undeclare-products --all`) so the redeploy window
-#      does not count failed requests against reliability
-#   4. `set-api-keys --anthropic "k1;k2;..."`
-#   5. redeploy each secondary worker (phala delete -> worker remove -> worker add)
-#      and wait for it to report `active`
-#   6. redeploy worker #1 (phala delete -> deploy), refusing to deploy if the
+#   2. `set-api-keys --anthropic "k1;k2;..."`
+#   3. for each secondary worker: `worker remove` FIRST (the gateway stops
+#      routing to it), then `phala cvms delete`, then `worker add`; wait for
+#      `active`, give the registry GM_SETTLE_SECS to probe the new keys, and
+#      stop if any of its slots reads `unverified key` — worker #1 is still
+#      serving on the old keys at that point, so nothing is lost
+#   4. redeploy worker #1 (phala delete -> deploy), refusing to deploy if the
 #      registry no longer lists it: `deploy` refreshes the oldest live worker,
-#      so it would overwrite a secondary instead
-#   7. flag any `unverified key` slot and print the re-declare commands
+#      so it would overwrite a secondary instead. Worker #1 cannot be
+#      deregistered first, so a request or two may fail while it restarts
+#   5. flag any `unverified key` slot
 #
-# Offers are NOT re-declared automatically; run the printed file once the
-# workers are active.
+# --withdraw restores the old behaviour: snapshot the offers, withdraw them all
+# before redeploying, and print the re-declare commands at the end (offers are
+# NOT re-declared automatically).
 #
 #   scripts/rotate-claude-keys.sh                 # prompts for keys (hidden)
 #   scripts/rotate-claude-keys.sh KEY1 KEY2       # keys as args (lands in shell history)
 #   scripts/rotate-claude-keys.sh --dry-run       # print the plan, change nothing
+#   scripts/rotate-claude-keys.sh --withdraw      # withdraw offers during the redeploy
 #
 # Environment overrides:
 #   GM_NETWORK          (default mainnet)
 #   GM_PRIMARY_APP      (default gm-mainnet-1)  app-name of worker #1
 #   GM_SECONDARY_APPS   (default gm-mainnet-2)  space-separated app-names
 #   GM_ACTIVE_TIMEOUT   (default 900)           seconds to wait for `active`
+#   GM_SETTLE_SECS      (default 600)           rolling: wait after a secondary is
+#                                               active before checking its key slots
 #
 # Written for bash 3.2 (macOS /bin/bash): no associative arrays, no mapfile.
 set -euo pipefail
@@ -37,11 +47,13 @@ NETWORK="${GM_NETWORK:-mainnet}"
 PRIMARY_APP="${GM_PRIMARY_APP:-gm-mainnet-1}"
 SECONDARY_APPS="${GM_SECONDARY_APPS:-gm-mainnet-2}"
 ACTIVE_TIMEOUT="${GM_ACTIVE_TIMEOUT:-900}"
+SETTLE_SECS="${GM_SETTLE_SECS:-600}"
 POLL_SECS=20
 PROBE_MODEL="claude-haiku-5-5"
 
 DRY_RUN=0
 ASSUME_YES=0
+WITHDRAW=0
 KEYS=()
 
 usage() {
@@ -57,6 +69,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     -y | --yes) ASSUME_YES=1 ;;
+    --withdraw) WITHDRAW=1 ;;
     -h | --help)
       usage
       exit 0
@@ -161,8 +174,10 @@ done
 
 # --- 2. snapshot offers -----------------------------------------------------
 
+offers=""
+if [ "$WITHDRAW" -eq 1 ]; then
 STEP="đọc offer hiện tại"
-echo "== 2. Lưu danh sách offer đang mở"
+echo "== Lưu danh sách offer đang mở (--withdraw)"
 status_out="$(gm status)"
 offers="$(printf '%s\n' "$status_out" | awk '
   /^PROVIDER[ ]+MODEL/ { inside = 1; next }
@@ -184,6 +199,7 @@ REDECLARE_FILE="$HOME/.gmcli/redeclare-$(date -u +%Y%m%dT%H%M%SZ).sh"
 } >"$REDECLARE_FILE"
 printf '%s\n' "$offers" | sed '/^$/d; s/^/  /'
 echo "  → lệnh khai báo lại: $REDECLARE_FILE"
+fi
 
 # --- helpers: phala + worker list ------------------------------------------
 
@@ -210,6 +226,34 @@ worker_list() { gm worker list 2>/dev/null || true; }
 worker_field_for_app() {
   [ -n "$1" ] || return 0
   worker_list | grep -F "$1" | grep -E '^[0-9A-Z]{26}[[:space:]]' | head -1 | awk -v f="$2" '{print $f}'
+}
+
+# True when `worker list` prints an `unverified key` line under this worker's
+# health block ("<worker_id> (<status>)" ... up to the next blank line).
+worker_has_unverified() {
+  [ -n "$1" ] || return 1
+  worker_list | awk -v w="$1" '
+    index($0, w " (") == 1 { inside = 1; next }
+    inside && NF == 0      { inside = 0 }
+    inside && /unverified key/ { found = 1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+# Rolling mode: before the next worker goes down, make sure this one actually
+# serves Claude on the new keys.
+settle_and_check_keys() {
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  [ "$WITHDRAW" -eq 1 ] && return 0
+  local app_id="$1" wid
+  wid="$(worker_field_for_app "$app_id" 1)"
+  echo "  … chờ ${SETTLE_SECS}s để registry kiểm tra key trên worker mới ($wid)"
+  sleep "$SETTLE_SECS"
+  if worker_has_unverified "$wid"; then
+    worker_list
+    die "worker mới $wid có slot 'unverified key' — DỪNG trước khi đụng worker #1 (worker #1 vẫn chạy key cũ, offer vẫn mở). Kiểm tra key rồi chạy lại script."
+  fi
+  echo "  ✓ không có slot 'unverified key'"
 }
 
 DELETE_FLAG=""
@@ -264,12 +308,21 @@ primary_wid="$(worker_field_for_app "$primary_old" 1)"
 
 echo
 echo "Kế hoạch (network $NETWORK):"
-echo "  - rút toàn bộ offer, đặt ${#KEYS[@]} key Claude mới"
+if [ "$WITHDRAW" -eq 1 ]; then
+  echo "  - rút toàn bộ offer, đặt ${#KEYS[@]} key Claude mới"
+else
+  echo "  - GIỮ offer, đặt ${#KEYS[@]} key Claude mới, thay lần lượt từng worker"
+fi
 for app in $SECONDARY_APPS; do
   echo "  - redeploy worker phụ '$app' (CVM $(cvm_app_id "$app"))"
 done
 echo "  - redeploy worker #1 '$PRIMARY_APP' (CVM $primary_old, worker $primary_wid)"
-echo "  Mỗi worker mất khoảng 5–10 phút; trong lúc đó không có offer nào mở."
+if [ "$WITHDRAW" -eq 1 ]; then
+  echo "  Mỗi worker mất khoảng 5–10 phút; trong lúc đó không có offer nào mở."
+else
+  echo "  Mỗi worker mất khoảng 5–10 phút (+${SETTLE_SECS}s chờ kiểm tra key); worker còn lại vẫn phục vụ."
+  [ -n "$SECONDARY_APPS" ] || echo "  ! Không có worker phụ: trong lúc redeploy worker #1 sẽ không worker nào phục vụ."
+fi
 if [ "$ASSUME_YES" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   read -r -p "Tiếp tục? [y/N] " ans
   case "$ans" in y | Y | yes) ;; *) die "đã huỷ, chưa thay đổi gì" ;; esac
@@ -278,8 +331,8 @@ fi
 # --- 3. withdraw ------------------------------------------------------------
 
 STEP="rút offer"
-echo "== 3. Rút toàn bộ offer"
-if [ -n "$offers" ]; then
+if [ "$WITHDRAW" -eq 1 ] && [ -n "$offers" ]; then
+  echo "== Rút toàn bộ offer"
   run gmcli --network "$NETWORK" undeclare-products --all
   UNDECLARED=1
 fi
@@ -287,7 +340,7 @@ fi
 # --- 4. keys ----------------------------------------------------------------
 
 STEP="lưu key"
-echo "== 4. Lưu key mới vào config"
+echo "== 2. Lưu key mới vào config"
 joined="$(
   IFS=";"
   echo "${KEYS[*]}"
@@ -303,20 +356,23 @@ fi
 
 for app in $SECONDARY_APPS; do
   STEP="redeploy $app"
-  echo "== 5. Redeploy worker phụ '$app'"
+  echo "== 3. Redeploy worker phụ '$app'"
   old="$(cvm_app_id "$app")"
   wid="$(worker_field_for_app "$old" 1)"
-  if [ -n "$old" ]; then delete_cvm "$old"; else echo "  (không có CVM '$app' — bỏ qua bước xoá)"; fi
+  # Deregister before teardown so the gateway stops routing to a dying CVM.
   if [ -n "$wid" ]; then run gmcli --network "$NETWORK" worker remove "$wid"; else echo "  (registry không có worker của '$app')"; fi
+  if [ -n "$old" ]; then delete_cvm "$old"; else echo "  (không có CVM '$app' — bỏ qua bước xoá)"; fi
   wait_cvm_gone "$app"
   run gmcli --network "$NETWORK" worker add --app-name "$app" --yes
-  wait_active "$(cvm_app_id "$app")"
+  new_app="$(cvm_app_id "$app")"
+  wait_active "$new_app"
+  settle_and_check_keys "$new_app"
 done
 
 # --- 6. worker #1 -----------------------------------------------------------
 
 STEP="redeploy $PRIMARY_APP"
-echo "== 6. Redeploy worker #1 '$PRIMARY_APP'"
+echo "== 4. Redeploy worker #1 '$PRIMARY_APP'"
 delete_cvm "$primary_old"
 wait_cvm_gone "$PRIMARY_APP"
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -334,7 +390,7 @@ fi
 # --- 7. verify + hand back --------------------------------------------------
 
 STEP="kiểm tra cuối"
-echo "== 7. Kiểm tra"
+echo "== 5. Kiểm tra"
 if [ "$DRY_RUN" -eq 0 ]; then
   wl="$(worker_list)"
   printf '%s\n' "$wl"
@@ -347,7 +403,12 @@ fi
 
 trap - EXIT
 echo
-echo "✓ Xong. Khai báo lại offer (chạy cả file hoặc từng dòng):"
-echo "    bash $REDECLARE_FILE"
-sed '1,2d; s/^/    /' "$REDECLARE_FILE"
-echo "  Các làn Claude sẽ eligible sau khoảng 10–15 phút, khi registry kiểm tra lại key."
+if [ "$UNDECLARED" -eq 1 ]; then
+  echo "✓ Xong. Khai báo lại offer (chạy cả file hoặc từng dòng):"
+  echo "    bash $REDECLARE_FILE"
+  sed '1,2d; s/^/    /' "$REDECLARE_FILE"
+  echo "  Các làn Claude sẽ eligible sau khoảng 10–15 phút, khi registry kiểm tra lại key."
+else
+  echo "✓ Xong. Offer vẫn mở suốt quá trình, không cần khai báo lại."
+  echo "  Kiểm tra: gmcli --network $NETWORK status"
+fi
