@@ -23,6 +23,11 @@
 #      deregistered first, so a request or two may fail while it restarts
 #   5. flag any `unverified key` slot
 #
+# --keep-keys skips steps 1-2: no Claude keys are asked for or changed, the
+# workers are just redeployed (rolling) with whatever `~/.gmcli/config.json`
+# holds now. Use it after `gmcli set-api-keys --deepinfra ...` (or any other
+# provider) so the new key reaches the TEE without touching the Claude slots.
+#
 # --withdraw restores the old behaviour: snapshot the offers, withdraw them all
 # before redeploying, and print the re-declare commands at the end (offers are
 # NOT re-declared automatically).
@@ -31,6 +36,7 @@
 #   scripts/rotate-claude-keys.sh KEY1 KEY2       # keys as args (lands in shell history)
 #   scripts/rotate-claude-keys.sh --dry-run       # print the plan, change nothing
 #   scripts/rotate-claude-keys.sh --withdraw      # withdraw offers during the redeploy
+#   scripts/rotate-claude-keys.sh --keep-keys     # redeploy only, keep current keys
 #
 # Environment overrides:
 #   GM_NETWORK          (default mainnet)
@@ -54,6 +60,7 @@ PROBE_MODEL="claude-haiku-5-5"
 DRY_RUN=0
 ASSUME_YES=0
 WITHDRAW=0
+KEEP_KEYS=0
 KEYS=()
 
 usage() {
@@ -70,6 +77,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     -y | --yes) ASSUME_YES=1 ;;
     --withdraw) WITHDRAW=1 ;;
+    --keep-keys) KEEP_KEYS=1 ;;
     -h | --help)
       usage
       exit 0
@@ -127,6 +135,11 @@ mask() {
 
 # --- 1. keys --------------------------------------------------------------
 
+if [ "$KEEP_KEYS" -eq 1 ] && [ "${#KEYS[@]}" -gt 0 ]; then
+  die "--keep-keys không nhận key (bỏ key đi, hoặc bỏ --keep-keys để đổi key)"
+fi
+
+if [ "$KEEP_KEYS" -eq 0 ]; then
 STEP="nhập key"
 if [ "${#KEYS[@]}" -eq 0 ]; then
   echo "Nhập từng key Claude (không hiện trên màn hình). Enter trống để kết thúc."
@@ -171,6 +184,9 @@ except Exception: print("")' 2>/dev/null || true)"
   fi
   echo "  ✓ key $(mask "$k") OK"
 done
+else
+  echo "== 1. --keep-keys: giữ nguyên key trong config, chỉ redeploy"
+fi
 
 # --- 2. snapshot offers -----------------------------------------------------
 
@@ -308,10 +324,15 @@ primary_wid="$(worker_field_for_app "$primary_old" 1)"
 
 echo
 echo "Kế hoạch (network $NETWORK):"
-if [ "$WITHDRAW" -eq 1 ]; then
-  echo "  - rút toàn bộ offer, đặt ${#KEYS[@]} key Claude mới"
+if [ "$KEEP_KEYS" -eq 1 ]; then
+  key_plan="giữ nguyên key hiện có trong config"
 else
-  echo "  - GIỮ offer, đặt ${#KEYS[@]} key Claude mới, thay lần lượt từng worker"
+  key_plan="đặt ${#KEYS[@]} key Claude mới"
+fi
+if [ "$WITHDRAW" -eq 1 ]; then
+  echo "  - rút toàn bộ offer, $key_plan"
+else
+  echo "  - GIỮ offer, $key_plan, thay lần lượt từng worker"
 fi
 for app in $SECONDARY_APPS; do
   echo "  - redeploy worker phụ '$app' (CVM $(cvm_app_id "$app"))"
@@ -341,13 +362,16 @@ fi
 
 STEP="lưu key"
 echo "== 2. Lưu key mới vào config"
-joined="$(
-  IFS=";"
-  echo "${KEYS[*]}"
-)"
-if [ "$DRY_RUN" -eq 1 ]; then
+if [ "$KEEP_KEYS" -eq 1 ]; then
+  echo "  (bỏ qua — --keep-keys)"
+elif [ "$DRY_RUN" -eq 1 ]; then
   echo "  [dry-run] gmcli set-api-keys --anthropic \"<${#KEYS[@]} key>\""
 else
+  # Inside the branch: "${KEYS[*]}" on an empty array trips `set -u` in bash 3.2.
+  joined="$(
+    IFS=";"
+    echo "${KEYS[*]}"
+  )"
   gmcli set-api-keys --anthropic "$joined" >/dev/null
   echo "  ✓ đã lưu ${#KEYS[@]} key"
 fi
